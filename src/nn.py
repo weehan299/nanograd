@@ -1,23 +1,31 @@
 import numpy as np
-from module import Module
-from tensor import Tensor
+from src.module import Module
+from src.tensor import Tensor
 
 class Linear(Module):
-    def __init__(self, in_features, out_features):
+    def __init__(self, in_features, out_features, bias: bool = True):
         super().__init__()
-        self.weight = Tensor(
-            # Kaiming initialisation
-            np.random.randn(in_features, out_features) * np.sqrt(2.0 / in_features),
-            requires_grad=True
-        )
-        self.bias = Tensor(
-            np.zeros(out_features),
-            requires_grad=True
-        )
+        self.in_features  = in_features
+        self.out_features = out_features
+        self.has_bias     = bias
+
+        # Kaiming (He) initialization for weight
+        self.weight = Tensor(np.random.randn(in_features, out_features) * np.sqrt(2.0 / in_features),requires_grad=True)
+
+        # Only create bias if requested
+        if self.has_bias:
+            self.bias = Tensor(np.zeros(out_features), requires_grad=True)
+        else:
+            self.bias = None
 
     def forward(self, x: Tensor) -> Tensor:
-        return x.matmul(self.weight) + self.bias
-
+        # x: (..., in_features)
+        y = x.matmul(self.weight)           # shape (..., out_features)
+        if self.has_bias:
+            # broadcast bias over all leading dims
+            y = y + self.bias
+        return y
+    
 class ReLU(Module):
     def forward(self, x: Tensor) -> Tensor:
         data = np.maximum(0,x.data)
@@ -104,32 +112,14 @@ class Embedding(Module):
         out._prev = {input_ids, self.weight}
         return out
 
-# Example usage and test
-if __name__ == "__main__":
-    print("Testing Embedding layer:")
+class PositionalEncoding(Module):
+    """Learned positional embeddings"""
     
-    # Test 1: Basic embedding
-    vocab_size = 10
-    embed_dim = 4
-    embedding = Embedding(vocab_size, embed_dim)
+    def __init__(self, max_len, embed_dim):
+        super().__init__()
+        self.embedding = Embedding(max_len, embed_dim)
     
-    # Create some token indices
-    tokens = Tensor([[1, 2, 3], [4, 5, 6]], requires_grad=False)
-    print(f"Input tokens shape: {tokens.data.shape}")
-    print(f"Input tokens:\n{tokens.data}")
-    
-    # Get embeddings
-    embeddings = embedding(tokens)
-    print(f"Embeddings shape: {embeddings.data.shape}")
-    print(f"Embeddings:\n{embeddings.data}")
-    
-    # Test backward pass
-    loss = embeddings.sum()
-    loss.backward()
-    print(f"Embedding weight gradient shape: {embedding.weight.grad.shape}")
-    print(f"Embedding weight gradient sum: {embedding.weight.grad.sum()}")
-    
-    print("\n" + "="*50)
-    print("Testing PositionalEncoding layer:")
-    
-
+    def forward(self, seq_len):
+        # Create position indices [0, 1, 2, ..., seq_len-1]
+        positions = Tensor(np.arange(seq_len), requires_grad=False)
+        return self.embedding(positions)

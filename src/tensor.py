@@ -3,19 +3,16 @@ import numpy as np
 
 class Tensor:
     def __init__(self, data, requires_grad=False):
-        self.data = np.array(data, dtype=float)
+        self.data = np.array(data, dtype=np.float32)
         self.requires_grad = requires_grad
         self.grad = np.zeros_like(self.data) if requires_grad else None
         self._backward = lambda: None
         self._prev = set()
-        self._other = None
-        self._out = None
+
 
     def __add__(self, other):
         other = other if isinstance(other, Tensor) else Tensor(other)
         out = Tensor(self.data + other.data, requires_grad=self.requires_grad or other.requires_grad)
-        self._other = other
-        self._out = out
         
         def _backward():
             if self.requires_grad:
@@ -114,13 +111,25 @@ class Tensor:
 
     def matmul(self, other):
         other = other if isinstance(other, Tensor) else Tensor(other)
-        out = Tensor(self.data.dot(other.data), requires_grad=self.requires_grad or other.requires_grad)
+        out = Tensor(self.data @ other.data,
+                    requires_grad=self.requires_grad or other.requires_grad)
 
         def _backward():
             if self.requires_grad:
-                self.grad += out.grad.dot(other.data.T)
+                # swap last two dims of other.data
+                b_T = other.data.swapaxes(-1, -2)
+                grad_a = out.grad @ b_T
+                # handle broadcasting back to self.data.shape if needed
+                grad_a = self._unbroadcast(grad_a, self.data.shape)
+                self.grad += grad_a
+
             if other.requires_grad:
-                other.grad += self.data.T.dot(out.grad)
+                # swap last two dims of self.data
+                a_T = self.data.swapaxes(-1, -2)
+                grad_b = a_T @ out.grad
+                # if other.data was broadcast, unbroadcast it
+                grad_b = other._unbroadcast(grad_b, other.data.shape)
+                other.grad += grad_b
 
         out._backward = _backward
         out._prev = {self, other}
@@ -170,6 +179,47 @@ class Tensor:
         out._prev = {self}
         return out
 
+    def masked_fill(self, mask: np.ndarray, value: float) -> "Tensor":
+        """
+        Return a new Tensor where entries corresponding to True in the mask
+        are set to `value`, with gradients blocked through those positions.
+        `mask` should be a boolean array broadcastable to self.data.shape.
+        """
+        # Ensure mask is a boolean array
+        mask = np.asarray(mask, dtype=bool)
+        
+        # Forward pass - handle broadcasting properly
+        out_data = self.data.copy()
+        
+        # Use numpy's where function which handles broadcasting properly
+        # First, we need to broadcast the mask to match self.data.shape
+        try:
+            # Try to broadcast mask to self.data.shape
+            broadcasted_mask = np.broadcast_to(mask, self.data.shape)
+            out_data = np.where(broadcasted_mask, value, out_data)
+        except ValueError as e:
+            # If broadcasting fails, provide a helpful error message
+            raise ValueError(f"Cannot broadcast mask with shape {mask.shape} to tensor with shape {self.data.shape}. "
+                            f"Original error: {e}")
+        
+        out = Tensor(out_data, requires_grad=self.requires_grad)
+
+        def _backward():
+            if self.requires_grad:
+                # upstream grad, but zeroed where mask is True
+                # Use the same broadcasting logic as the forward pass
+                try:
+                    broadcasted_mask = np.broadcast_to(mask, self.data.shape)
+                    grad_mask = np.where(broadcasted_mask, 0.0, out.grad)
+                    self.grad += grad_mask
+                except ValueError:
+                    # This should not happen if forward pass succeeded
+                    pass
+
+        out._backward = _backward
+        out._prev = {self}
+        return out
+        
     def T(self):
         out = Tensor(self.data.T, requires_grad=self.requires_grad)
 
@@ -181,107 +231,99 @@ class Tensor:
         out._prev = {self}
         return out
 
+    def transpose(self, axis1=-2, axis2=-1):
+        """Transpose tensor along specified axes"""
+        # Handle negative axes
+        if axis1 < 0:
+            axis1 = self.data.ndim + axis1
+        if axis2 < 0:
+            axis2 = self.data.ndim + axis2
+        
+        # Create axes permutation
+        axes = list(range(self.data.ndim))
+        axes[axis1], axes[axis2] = axes[axis2], axes[axis1]
+        
+        out_data = np.transpose(self.data, axes)
+        out = Tensor(out_data, requires_grad=self.requires_grad)
+        
+        def _backward():
+            if self.requires_grad:
+                # Transpose gradient back
+                self.grad += np.transpose(out.grad, axes)
+        
+        out._backward = _backward
+        out._prev = {self}
+        return out
+        
+    def reshape(self, new_shape):
+        """Reshape tensor to new shape"""
+        out_data = self.data.reshape(new_shape)
+        out = Tensor(out_data, requires_grad=self.requires_grad)
+        
+        def _backward():
+            if self.requires_grad:
+                self.grad += out.grad.reshape(self.data.shape)
+        out._backward = _backward
+        out._prev = {self}
+        return out
+
+            
     def backward(self, grad=None):
+        """Optimized backward pass with memory management"""
         if not self.requires_grad:
             raise RuntimeError("Cannot call backward on a tensor that does not require gradients.")
-        # initialize gradient of the output
+        
         self.grad = grad if grad is not None else np.ones_like(self.data)
 
-        # build topological order
+        # OPTIMIZATION: Use iterative approach instead of recursive for large graphs
         topo = []
         visited = set()
+        stack = [self]
+        
+        # Build topological order iteratively
+        while stack:
+            node = stack.pop()
+            if node in visited:
+                continue
+            
+            # Check if all children have been visited
+            all_children_visited = all(child in visited for child in node._prev)
+            
+            if all_children_visited:
+                visited.add(node)
+                topo.append(node)
+            else:
+                # Add back to stack and add unvisited children
+                stack.append(node)
+                for child in node._prev:
+                    if child not in visited:
+                        stack.append(child)
 
-        def build(v):
-            if v not in visited:
-                visited.add(v)
-                for child in v._prev:
-                    build(child)
-                topo.append(v)
-
-        build(self)
-
-        # propagate gradients
+        # Propagate gradients
         for node in reversed(topo):
             node._backward()
+            
+        # OPTIMIZATION: Clear computation graph after backward pass to save memory
+        self._clear_graph()
+
+    def _clear_graph(self):
+        """Clear computation graph to save memory"""
+        visited = set()
+        stack = [self]
+        
+        while stack:
+            node = stack.pop()
+            if node in visited:
+                continue
+            
+            visited.add(node)
+            
+            # Clear backward function and previous nodes
+            node._backward = lambda: None
+            for child in node._prev:
+                stack.append(child)
+            node._prev.clear()
 
     def __repr__(self):
         return f"Tensor(data={self.data}, requires_grad={self.requires_grad})"
 
-
-
-# Example usage
-if __name__ == "__main__":
-    x = Tensor([1, 2, 3], requires_grad=True)
-    #y = x * x + 2 * x + 1
-    #z = y.sum()
-    #z.backward()
-    y = Tensor([4,5,6], requires_grad=True)
-    z = x*y
-    z.backward()
-
-    print("x:", x)
-    print("y:", y)
-    print("z:", z)
-    print("Gradient of x:", x.grad)
-    print("Gradient of y:", y.grad)
-
-
-    a = Tensor([1, 2, 3], requires_grad=True)
-    b = Tensor([4, 5, 6], requires_grad=True)
-    c = a/b
-    c.backward() 
-    print("a:", a)
-    print("b:", b)
-    print("c:", c)
-    print("gradient of a:", a.grad)
-    print("gradient of b:", b.grad)
-    print("gradient of c:", c.grad)
-
-    print("*" * 40)
-    # Test 1: Sum all elements
-    def test_sum_all():
-        x = Tensor([[1, 2], [3, 4]], requires_grad=True)
-        y = x.sum()
-        y.backward()
-        print(f"Sum all: {y.data}")  # Should be 10
-        print(f"y grad: {y.grad}")  # Should be 1
-        print(f"Gradient: {x.grad}")  # Should be [[1, 1], [1, 1]]
-
-    # Test 2: Sum along axis 0
-    def test_sum_axis0():
-        x = Tensor([[1, 2], [3, 4]], requires_grad=True)
-        y = x.sum(dim=0)
-        y.backward()
-        print(f"Sum axis 0: {y.data}")  # Should be [4, 6]
-        print(f"Gradient: {x.grad}")  # Should be [[1, 1], [1, 1]]
-
-    # Test 3: Sum along axis 1
-    def test_sum_axis1():
-        x = Tensor([[1, 2], [3, 4]], requires_grad=True)
-        y = x.sum(dim=1)
-        y.backward()
-        print(f"Sum axis 1: {y.data}")  # Should be [3, 7]
-        print(f"Gradient: {x.grad}")  # Should be [[1, 1], [1, 1]]
-
-    # Test 4: Sum with keepdims=True
-    def test_sum_keepdims():
-        x = Tensor([[1, 2], [3, 4]], requires_grad=True)
-        y = x.sum(dim=0, keepdims=True)
-        y.backward()
-        print(f"Sum keepdims: {y.data}")  # Should be [[4, 6]]
-        print(f"Gradient: {x.grad}")  # Should be [[1, 1], [1, 1]]
-
-    # Test 5: Sum with negative axis
-    def test_sum_negative_axis():
-        x = Tensor([[1, 2], [3, 4]], requires_grad=True)
-        y = x.sum(dim=-1)  # Same as dim=1
-        y.backward()
-        print(f"Sum negative axis: {y.data}")  # Should be [3, 7]
-        print(f"Gradient: {x.grad}")  # Should be [[1, 1], [1, 1]]
-
-    # Run tests
-    test_sum_all()
-    test_sum_axis0()
-    test_sum_axis1()
-    test_sum_keepdims()
-    test_sum_negative_axis()

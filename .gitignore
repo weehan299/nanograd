@@ -1,5 +1,6 @@
-all_py_texts.txt
-merge.sh
+all_python_texts.txt
+collect_py.bat
+models/
 .ipynb_checkpoints
 *.ipynb_checkpoints
 # Byte-compiled / optimized / DLL files
@@ -49,4 +50,4 @@ pip-delete-this-directory.txt
 htmlcov/
 .tox/
 .nox/
-.coverage
+.coveragemodels/
