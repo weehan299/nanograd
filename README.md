@@ -1,4 +1,4 @@
-# GPT-from-Scratch: A Complete Deep Learning Framework
+# Nanograd: A Complete Deep Learning Framework
 
 A minimalist yet comprehensive deep learning framework built from scratch in Python, implementing the core components of PyTorch including automatic differentiation, neural network layers, and a GPT language model.
 
